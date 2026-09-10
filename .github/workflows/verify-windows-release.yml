@@ -72,5 +72,11 @@ jobs:
           })().catch(error => { console.error(error); process.exitCode = 1; });
           '@ | Set-Content $probe -Encoding utf8
           $env:ELECTRON_RUN_AS_NODE = '1'
-          & $exe $probe $installDir
-          if ($LASTEXITCODE -ne 0) { throw 'Installed updater verification failed' }
+          $stdout = Join-Path $env:RUNNER_TEMP 'updater-probe.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'updater-probe.stderr.log'
+          $probeProcess = Start-Process -FilePath $exe -ArgumentList "`"$probe`" `"$installDir`"" -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Get-Content $stdout
+          Get-Content $stderr
+          if ($probeProcess.ExitCode -ne 0) { throw "Installed updater verification failed: $($probeProcess.ExitCode)" }
+          $result = Get-Content $stdout | Where-Object { $_ -match '^\{' } | Select-Object -Last 1 | ConvertFrom-Json
+          if (!$result.installed -or !$result.anonymousChannel) { throw 'Updater verification result missing' }
