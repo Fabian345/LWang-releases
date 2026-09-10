@@ -1,0 +1,76 @@
+name: Verify public Windows update
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published stable version to verify
+        required: true
+        default: '2.0.9'
+permissions:
+  contents: read
+jobs:
+  public-download-and-install:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      LWANG_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download without authentication and verify checksum
+        shell: pwsh
+        run: |
+          $version = $env:LWANG_VERSION
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
+          $base = "https://github.com/Fabian345/LWang-releases/releases/download/lwang-v$version"
+          $name = "lwang-harness-$version-win32-x64.exe"
+          $installer = Join-Path $env:RUNNER_TEMP $name
+          $sums = (Invoke-WebRequest "$base/SHA256SUMS").Content
+          if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+          $line = @($sums -split '\r?\n' | Where-Object { $_ -match ('^[a-f0-9]{64}  ' + [regex]::Escape($name) + '$') })
+          if ($line.Count -ne 1) { throw 'Expected exactly one installer checksum' }
+          Invoke-WebRequest "$base/$name" -OutFile $installer
+          $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $line[0].Substring(0, 64)) { throw 'Checksum mismatch' }
+          "LWANG_INSTALLER=$installer" >> $env:GITHUB_ENV
+          Write-Output "Public installer checksum verified: $actual"
+      - name: Install and check the packaged update client
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'LWangPublicInstall'
+          $process = Start-Process -FilePath $env:LWANG_INSTALLER -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exit code: $($process.ExitCode)" }
+          $exe = Join-Path $installDir 'lwang-harness.exe'
+          if (!(Test-Path $exe)) { throw 'Installed application missing' }
+          $probe = Join-Path $env:RUNNER_TEMP 'verify-installed-updater.cjs'
+          @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { pathToFileURL } = require('node:url');
+          const assert = require('node:assert/strict');
+          (async () => {
+            const asar = path.join(process.argv[2], 'resources', 'app.asar');
+            const version = process.env.LWANG_VERSION;
+            const pkg = JSON.parse(fs.readFileSync(path.join(asar, 'package.json'), 'utf8'));
+            assert.equal(pkg.version, version);
+            const lib = path.join(asar, 'lib');
+            const chunks = fs.readdirSync(lib).filter(name => /^lwang-release-.*\.js$/.test(name));
+            assert.equal(chunks.length, 1);
+            const chunk = path.join(lib, chunks[0]);
+            const code = fs.readFileSync(chunk, 'utf8');
+            assert.ok(code.includes('Fabian345/LWang-releases'));
+            const alias = code.match(/checkForLwangUpdate as (\w+)/);
+            assert.ok(alias, 'Packaged update checker export missing');
+            const module = await import(pathToFileURL(chunk).href);
+            const check = module[alias[1]];
+            const options = { channel: 'stable', currentChannel: 'stable', platform: 'win32', arch: 'x64', request: globalThis.fetch };
+            const current = await check({ ...options, currentVersion: version });
+            assert.equal(current?.status, 'up-to-date');
+            assert.equal(current?.latestVersion, version);
+            const older = await check({ ...options, currentVersion: '0.0.0' });
+            assert.equal(older?.status, 'update-available');
+            assert.equal(older?.latestVersion, version);
+            console.log(JSON.stringify({ version, installed: true, anonymousChannel: true, currentVersionCheck: current.status, olderVersionCheck: older.status }));
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          '@ | Set-Content $probe -Encoding utf8
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          & $exe $probe $installDir
+          if ($LASTEXITCODE -ne 0) { throw 'Installed updater verification failed' }
